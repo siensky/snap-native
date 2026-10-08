@@ -1,0 +1,115 @@
+networks:
+  internal:
+
+volumes:
+  postgres-data:
+  rabbitmq-data:
+
+configs:
+  nginx-conf:
+    content: |
+      events {}
+
+      http {
+        # Docker's embedded DNS. A plain `upstream {}` block resolves once at
+        # startup and would freeze at whatever replica count existed then — a
+        # variable in proxy_pass forces Nginx to re-resolve "backend" on every
+        # request instead, which is what makes it round-robin across replicas
+        # as BACKEND_INSTANCES changes, no reload needed.
+        resolver 127.0.0.11 valid=10s;
+
+        server {
+          listen 80;
+
+          location / {
+            set $backend_upstream http://backend:3000;
+            proxy_pass $backend_upstream;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host $host;
+          }
+        }
+      }
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: ../Dockerfile
+    restart: unless-stopped
+    deploy:
+      # The "instances" in "minst två backend-instanser": separate containers,
+      # not a code change. Scale at runtime instead with
+      # `docker compose up --scale backend=N`.
+      replicas: ${BACKEND_INSTANCES:-3}
+    env_file: ./backend/.env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672
+    command: bun run dev
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks: [internal]
+
+  notification-service:
+    build:
+      context: ./notification-service
+      dockerfile: ../Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks: [internal]
+
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    configs:
+      - source: nginx-conf
+        target: /etc/nginx/nginx.conf
+    depends_on:
+      - backend
+      - notification-service
+    networks: [internal]

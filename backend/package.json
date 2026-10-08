@@ -1,0 +1,26 @@
+{
+  "name": "backend",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "bun run --sql-preconnect src/index.ts"
+  },
+  "devDependencies": {
+    "@types/amqplib": "^0.10.8",
+    "@types/bun": "latest",
+    "dbmate": "^2.35.1",
+    "socket.io-client": "^4.8.3"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@fastify/jwt": "^10.2.2",
+    "@fastify/multipart": "^10.1.1",
+    "amqplib": "^2.2.0",
+    "bcrypt": "^6.0.0",
+    "fastify": "^5.12.1",
+    "socket.io": "^4.8.3"
+  }
+}

@@ -1,8 +1,9 @@
-import { sql } from 'bun'
+import { shardFor } from './shards'
 
-// A user can have more than one device, so more than one token.
+// push_tokens is never duplicated across shards (see backend/src/db/shards.ts) —
+// a user's tokens always live on their own home shard.
 export async function getPushTokensForUser(username: string): Promise<string[]> {
-    const rows = await sql`
+    const rows = await shardFor(username)`
         SELECT pt.token
         FROM push_tokens pt
         JOIN users u ON u.id = pt.user_id

@@ -1,9 +1,10 @@
-import { sql } from 'bun'
-import type { AddFriendResult, CreateSnapInput, FriendListEntry, InboxEntry, IncomingFriendRequest, MessageRow, MessageWithSender, PublicUser, SnapRow, SnapWithSender, UserRow } from './types'
+import type { SQL } from 'bun'
+import { shardFor, shardsFor } from '../db/shards'
+import type { AddFriendResult, ConversationEntry, CreateSnapInput, FriendListEntry, InboxEntry, IncomingFriendRequest, MessageRow, SnapRow, UserRow } from './types'
 
 // Check if user exists
 export async function userExists(username: string): Promise<boolean> {
-    const rows = await sql`
+    const rows = await shardFor(username)`
         SELECT 1 FROM users WHERE username = ${username}
     `
     return rows.length > 0
@@ -11,7 +12,7 @@ export async function userExists(username: string): Promise<boolean> {
 
 // Insert user
 export async function insertUser(username: string, passwordHash: string): Promise<UserRow> {
-    const [user] = await sql`
+    const [user] = await shardFor(username)`
         INSERT INTO users (username, password_hash)
         VALUES (${username}, ${passwordHash})
         RETURNING *
@@ -19,17 +20,9 @@ export async function insertUser(username: string, passwordHash: string): Promis
     return user as UserRow
 }
 
-// Fetch user by id
-export async function getUserById(id: string): Promise<UserRow | null> {
-    const [user] = await sql`
-        SELECT * FROM users WHERE id = ${id}
-    `
-    return (user as UserRow | undefined) ?? null
-}
-
 // Fetch user by username
 export async function getUserByUsername(username: string): Promise<UserRow | null> {
-    const [user] = await sql`
+    const [user] = await shardFor(username)`
         SELECT * FROM users WHERE username = ${username}
     `
     return (user as UserRow | undefined) ?? null
@@ -37,69 +30,66 @@ export async function getUserByUsername(username: string): Promise<UserRow | nul
 
 // Add a friend, by username at both ends — the JWT carries a username, not an id.
 //
-// `me` and `them` resolve the usernames to ids and hold 0 or 1 rows each. The
-// insert is INSERT..SELECT over their cross join, so an unknown username makes
-// it a no-op instead of a foreign-key error — that's what friend_exists reports.
-// `ins` then holds 0 or 1 rows (0 when ON CONFLICT swallowed a repeat add) and
-// EXISTS turns that into `created`. The outer SELECT has no FROM, so the
-// statement always returns exactly one row.
+// friendUsername's account lives on ITS OWN home shard (users are never
+// duplicated), so its existence is checked there, not here. The edge itself
+// mentions both users, so it's written to every shard either of them calls
+// home (shardsFor) — that's what lets getFriends/areFriends/
+// getIncomingFriendRequests below stay single-shard reads for both parties.
+// `friend_created_at` is snapshotted at write time for the same reason:
+// getFriends can't join to a users row that might live on the other shard.
 export async function addFriend(username: string, friendUsername: string): Promise<AddFriendResult> {
-    const [row] = await sql`
-        WITH me AS (
-            SELECT id FROM users WHERE username = ${username}
-        ),
-        them AS (
-            SELECT id FROM users WHERE username = ${friendUsername}
-        ),
-        ins AS (
-            INSERT INTO friendships (user_id, friend_id)
-            SELECT me.id, them.id FROM me, them
+    const friend = await getUserByUsername(friendUsername)
+    if (!friend) return { friend_exists: false, created: false, mutual: false }
+
+    const home = shardFor(username)
+
+    // Did they already add me? If so, that edge was duplicated onto my
+    // shard when THEY called addFriend — no cross-shard query needed.
+    const [reverse] = await home`
+        SELECT 1 FROM friendships
+        WHERE user_username = ${friendUsername} AND friend_username = ${username}
+    `
+    const mutual = !!reverse
+
+    let created = false
+    for (const shard of shardsFor([username, friendUsername])) {
+        const [row] = await shard`
+            INSERT INTO friendships (user_username, friend_username, friend_created_at)
+            VALUES (${username}, ${friendUsername}, ${friend.created_at})
             ON CONFLICT DO NOTHING
             RETURNING 1
-        )
-        SELECT
-            EXISTS (SELECT 1 FROM them) AS friend_exists,
-            EXISTS (SELECT 1 FROM ins)  AS created,
-            EXISTS (
-                SELECT 1 FROM friendships f, me, them
-                WHERE f.user_id = them.id AND f.friend_id = me.id
-            ) AS mutual
-    `
-    return row as AddFriendResult
+        `
+        if (shard === home) created = !!row
+    }
+
+    return { friend_exists: true, created, mutual }
 }
 
 // Are these two actually friends? Requires the edge in both directions.
-// An unknown username leaves its CTE empty, so both EXISTS are false.
+// Both directions are findable on MY shard alone: my outgoing edge lives here
+// because I wrote it here, and their outgoing edge (if any) was duplicated
+// here the moment they added me — see addFriend.
 export async function areFriends(username: string, otherUsername: string): Promise<boolean> {
-    const [row] = await sql`
-        WITH me AS (
-            SELECT id FROM users WHERE username = ${username}
-        ),
-        them AS (
-            SELECT id FROM users WHERE username = ${otherUsername}
-        )
+    const [row] = await shardFor(username)`
         SELECT (
-            EXISTS (
-                SELECT 1 FROM friendships f, me, them
-                WHERE f.user_id = me.id AND f.friend_id = them.id
-            )
-            AND EXISTS (
-                SELECT 1 FROM friendships f, me, them
-                WHERE f.user_id = them.id AND f.friend_id = me.id
-            )
+            EXISTS (SELECT 1 FROM friendships WHERE user_username = ${username} AND friend_username = ${otherUsername})
+            AND
+            EXISTS (SELECT 1 FROM friendships WHERE user_username = ${otherUsername} AND friend_username = ${username})
         ) AS friends
     `
     return (row as { friends: boolean }).friends
 }
 
 // Remove a friend for a user. Idempotent — an unknown username or an edge
-// that isn't there deletes zero rows without erroring.
+// that isn't there deletes zero rows without erroring. Removed from every
+// shard the edge was written to, same set as addFriend used.
 export async function deleteFriend(username: string, friendUsername: string): Promise<void> {
-    await sql`
-        DELETE FROM friendships
-        WHERE user_id   = (SELECT id FROM users WHERE username = ${username})
-          AND friend_id = (SELECT id FROM users WHERE username = ${friendUsername})
-    `
+    for (const shard of shardsFor([username, friendUsername])) {
+        await shard`
+            DELETE FROM friendships
+            WHERE user_username = ${username} AND friend_username = ${friendUsername}
+        `
+    }
 }
 
 // Everyone this user has added, each flagged with whether it's mutual.
@@ -107,42 +97,37 @@ export async function deleteFriend(username: string, friendUsername: string): Pr
 // when the other person hasn't added back — that's the pending case.
 // Confirmed friends sort first.
 export async function getFriends(username: string): Promise<FriendListEntry[]> {
-    const rows = await sql`
-        WITH me AS (
-            SELECT id FROM users WHERE username = ${username}
-        )
+    const rows = await shardFor(username)`
         SELECT
-            u.username,
-            u.created_at,
-            (r.user_id IS NOT NULL) AS mutual
+            f.friend_username AS username,
+            f.friend_created_at AS created_at,
+            (r.user_username IS NOT NULL) AS mutual
         FROM friendships f
-        JOIN me ON me.id = f.user_id
-        JOIN users u ON u.id = f.friend_id
         LEFT JOIN friendships r
-               ON r.user_id = f.friend_id AND r.friend_id = f.user_id
-        ORDER BY mutual DESC, u.username
+               ON r.user_username = f.friend_username AND r.friend_username = f.user_username
+        WHERE f.user_username = ${username}
+        ORDER BY mutual DESC, f.friend_username
     `
     return rows as FriendListEntry[]
 }
 
-// Create a snap and fan it out to its recipients in one transaction.
+// Create a snap and fan it out to its recipients.
 //
-// Phase 1 of 2. A photo snap is written without media_key/media_mime — the
-// object is uploaded afterwards and attached with setSnapMedia. Writing the row
-// first means a failed upload leaves a snap without media (findable, cleanable)
-// rather than an S3 object nothing references. A photo may carry an optional
-// caption in body.
-//
-// Either the snap and every recipient row land together, or nothing does, so a
-// snap can't exist with nobody able to see it.
-//
-// Recipients are inserted one at a time so a bad username names itself in the
-// error. Lists are short; if they ever aren't, this becomes one INSERT..SELECT
-// over `= ANY(sql.array(recipients))`.
+// A recipient's copy of the snap (and their snap_recipients row) only ever
+// needs to exist on THEIR shard — nobody else reads it back. So this writes
+// once per distinct recipient shard, each in its own local transaction
+// (either the snap + that shard's recipient rows all land, or none do — but
+// across shards there's no single atomic commit; a failure after the first
+// shard's transaction succeeds leaves a partial fan-out, same tradeoff any
+// non-2PC multi-database write has). id and created_at are generated once in
+// application code, not left to each database's own default/now(), so every
+// shard's copy of "the same" snap is identical rather than independently
+// random.
 export async function createSnap(input: CreateSnapInput): Promise<SnapRow> {
     const { senderUsername, type, expiresAt } = input
 
-    // The (snap_id, recipient_id) primary key would reject a repeated username.
+    // The (snap_id, recipient_username) primary key would reject a repeated
+    // username.
     const recipients = [...new Set(input.recipientUsernames)]
 
     if (recipients.length === 0) {
@@ -152,56 +137,74 @@ export async function createSnap(input: CreateSnapInput): Promise<SnapRow> {
     // Required for text, an optional caption for photo.
     const body = input.body ?? null
 
-    return await sql.begin(async (tx) => {
-        const [row] = await tx`
-            INSERT INTO snaps (sender_id, type, body, expires_at)
-            SELECT id, ${type}, ${body}, ${expiresAt}
-            FROM users WHERE username = ${senderUsername}
-            RETURNING *
-        `
+    const id = crypto.randomUUID()
+    const createdAt = new Date()
 
-        // INSERT..SELECT inserts nothing rather than erroring on an unknown
-        // username, so an empty RETURNING is how that surfaces.
-        if (!row) throw new Error(`Unknown sender: ${senderUsername}`)
+    const recipientsByShard = new Map<SQL, string[]>()
+    for (const recipient of recipients) {
+        const shard = shardFor(recipient)
+        const list = recipientsByShard.get(shard)
+        if (list) list.push(recipient)
+        else recipientsByShard.set(shard, [recipient])
+    }
 
-        for (const username of recipients) {
-            const [recipient] = await tx`
-                INSERT INTO snap_recipients (snap_id, recipient_id)
-                SELECT ${row.id}, id FROM users WHERE username = ${username}
-                RETURNING recipient_id
+    let row: SnapRow | undefined
+    for (const [shard, shardRecipients] of recipientsByShard) {
+        row = (await shard.begin(async (tx) => {
+            const [snap] = await tx`
+                INSERT INTO snaps (id, sender_username, type, body, expires_at, created_at)
+                VALUES (${id}, ${senderUsername}, ${type}, ${body}, ${expiresAt}, ${createdAt})
+                RETURNING *
             `
-            if (!recipient) throw new Error(`Unknown recipient: ${username}`)
-        }
 
-        return row as SnapRow
-    }) as SnapRow
+            for (const recipient of shardRecipients) {
+                await tx`
+                    INSERT INTO snap_recipients (snap_id, recipient_username)
+                    VALUES (${id}, ${recipient})
+                `
+            }
+
+            return snap
+        })) as SnapRow
+    }
+
+    // recipients is non-empty, so recipientsByShard has at least one entry
+    // and the loop above ran at least once.
+    return row!
 }
 
 // Phase 2 of 2. Attach uploaded media to a photo snap that doesn't have any yet.
 //
 // The WHERE clause is the guard: it matches only a photo snap whose media_key is
 // still null, so a retried or duplicated upload can't overwrite media already
-// attached. Returns null when nothing matched — snap missing, wrong type, or
-// media already set.
+// attached. Applied to every shard a recipient's copy landed on (see
+// createSnap) — recipientUsernames is how this function knows which shards
+// that is, since nothing else records it after the fact.
 //
 // The key should be random (crypto.randomUUID()), not the snap id: it travels
 // inside every presigned URL, and a sequential id there would leak the snap count.
 export async function setSnapMedia(
     snapId: string,
     mediaKey: string,
-    mediaMime: string
+    mediaMime: string,
+    recipientUsernames: string[]
 ): Promise<SnapRow | null> {
-    const [row] = await sql`
-        UPDATE snaps
-        SET media_key = ${mediaKey}, media_mime = ${mediaMime}
-        WHERE id = ${snapId}
-          AND type = 'photo'
-          AND media_key IS NULL
-        RETURNING *
-    `
-    return (row as SnapRow | undefined) ?? null
-}
+    let result: SnapRow | null = null
 
+    for (const shard of shardsFor(recipientUsernames)) {
+        const [row] = await shard`
+            UPDATE snaps
+            SET media_key = ${mediaKey}, media_mime = ${mediaMime}
+            WHERE id = ${snapId}
+              AND type = 'photo'
+              AND media_key IS NULL
+            RETURNING *
+        `
+        if (row) result = row as SnapRow
+    }
+
+    return result
+}
 
 // Read a snap once, and burn it in the same breath.
 //
@@ -215,26 +218,24 @@ export async function setSnapMedia(
 // tell apart: no such snap, not a recipient of it, already viewed, or expired.
 // The service turns all of them into the same 404.
 //
-// `id` must already be known to be digits — a non-numeric value would make
-// Postgres throw on the bigint cast instead of returning empty.
+// Single-shard: a recipient's copy of a snap only ever exists on their own
+// home shard (see createSnap), so there's nothing to look up elsewhere.
 export async function claimSnapForRecipient(
     snapId: string,
     username: string
-): Promise<SnapWithSender | null> {
-    const [row] = await sql`
+): Promise<SnapRow | null> {
+    const [row] = await shardFor(username)`
         UPDATE snap_recipients sr
         SET viewed_at = now()
-        FROM snaps s, users sender, users me
-        WHERE sr.snap_id      = s.id
-          AND sender.id       = s.sender_id
-          AND me.username     = ${username}
-          AND sr.recipient_id = me.id
-          AND sr.snap_id      = ${snapId}
+        FROM snaps s
+        WHERE sr.snap_id = s.id
+          AND sr.recipient_username = ${username}
+          AND sr.snap_id = ${snapId}
           AND sr.viewed_at IS NULL
           AND s.expires_at > now()
-        RETURNING s.*, sender.username AS sender_username
+        RETURNING s.*
     `
-    return (row as SnapWithSender | undefined) ?? null
+    return (row as SnapRow | undefined) ?? null
 }
 
 // Everything waiting for this user: not yet viewed, not yet expired.
@@ -242,21 +243,17 @@ export async function claimSnapForRecipient(
 // Metadata only — no body, no media_key. Listing the inbox must never be able to
 // burn a snap, and the content is claimSnapForRecipient's job.
 export async function getInboxForUser(username: string): Promise<InboxEntry[]> {
-    const rows = await sql`
-        WITH me AS (
-            SELECT id FROM users WHERE username = ${username}
-        )
+    const rows = await shardFor(username)`
         SELECT
             s.id,
-            sender.username AS sender_username,
+            s.sender_username,
             s.type,
             s.created_at,
             s.expires_at
         FROM snap_recipients sr
-        JOIN me ON me.id = sr.recipient_id
         JOIN snaps s ON s.id = sr.snap_id
-        JOIN users sender ON sender.id = s.sender_id
-        WHERE sr.viewed_at IS NULL
+        WHERE sr.recipient_username = ${username}
+          AND sr.viewed_at IS NULL
           AND s.expires_at > now()
         ORDER BY s.created_at DESC
     `
@@ -273,116 +270,165 @@ export async function setScreenshot(
     snapId: string,
     username: string
 ): Promise<{ sender_username: string } | null> {
-    const [row] = await sql`
+    const [row] = await shardFor(username)`
         UPDATE snap_recipients sr
         SET screenshot = TRUE
-        FROM snaps s, users sender, users me
-        WHERE sr.snap_id      = s.id
-          AND sender.id       = s.sender_id
-          AND me.username     = ${username}
-          AND sr.recipient_id = me.id
-          AND sr.snap_id      = ${snapId}
-        RETURNING sender.username AS sender_username
+        FROM snaps s
+        WHERE sr.snap_id = s.id
+          AND sr.recipient_username = ${username}
+          AND sr.snap_id = ${snapId}
+        RETURNING s.sender_username
     `
     return (row as { sender_username: string } | undefined) ?? null
 }
 
 // People who added this user and haven't been added back — the pending incoming
 // requests. UPPGIFT.md keeps these out of getFriends on purpose, so this is the
-// mirror image of it: join on f.friend_id instead of f.user_id, and the same
-// LEFT JOIN against the reverse edge, kept only where that edge is missing.
-//
-// Supported by `create index on friendships (friend_id)` in the initial migration.
+// mirror image of it: filter on friend_username instead of user_username, and
+// the same LEFT JOIN against the reverse edge, kept only where that edge is
+// missing. Single-shard for the same reason getFriends is — every edge naming
+// this user was duplicated onto their own shard when it was written.
+export async function getIncomingFriendRequests(username: string): Promise<IncomingFriendRequest[]> {
+    const rows = await shardFor(username)`
+        SELECT
+            f.user_username AS username,
+            f.created_at
+        FROM friendships f
+        LEFT JOIN friendships r
+               ON r.user_username = f.friend_username AND r.friend_username = f.user_username
+        WHERE f.friend_username = ${username}
+          AND r.user_username IS NULL
+        ORDER BY f.created_at DESC
+    `
+    return rows as IncomingFriendRequest[]
+}
+
 // client_id is the sender's idempotency key. ON CONFLICT turns a retried POST
 // (same sender, same client_id) into a no-op write that still RETURNs the
-// original row, so the caller can't tell a retry from the first attempt.
-// Unknown usernames behave like addFriend: the cross join is empty, so the
-// INSERT..SELECT inserts nothing and this returns null.
+// original row, so the caller can't tell a retry from the first attempt —
+// enforced independently per shard copy, which is fine since a retry always
+// carries the same client_id on every copy.
+//
+// Messages are immutable once written, so duplicating a copy onto both
+// participants' shards (when they differ) needs no sync afterwards. id and
+// created_at are generated once in application code so both copies describe
+// the exact same message rather than two independently-timestamped ones —
+// getMessages below orders by created_at, not id, since a uuid carries no
+// chronological order the way the old bigserial id did.
 export async function insertMessage(
     clientId: string,
     senderUsername: string,
     recipientUsername: string,
     body: string
 ): Promise<MessageRow | null> {
-    const [row] = await sql`
-        WITH sender AS (
-            SELECT id FROM users WHERE username = ${senderUsername}
-        ),
-        recipient AS (
-            SELECT id FROM users WHERE username = ${recipientUsername}
-        )
-        INSERT INTO messages (client_id, sender_id, recipient_id, body)
-        SELECT ${clientId}, sender.id, recipient.id, ${body}
-        FROM sender, recipient
-        ON CONFLICT (sender_id, client_id) DO UPDATE SET body = messages.body
-        RETURNING *
-    `
-    return (row as MessageRow | undefined) ?? null
+    const id = crypto.randomUUID()
+    const createdAt = new Date()
+
+    let result: MessageRow | null = null
+
+    for (const shard of shardsFor([senderUsername, recipientUsername])) {
+        const [row] = await shard`
+            INSERT INTO messages (id, client_id, sender_username, recipient_username, body, created_at)
+            VALUES (${id}, ${clientId}, ${senderUsername}, ${recipientUsername}, ${body}, ${createdAt})
+            ON CONFLICT (sender_username, client_id) DO UPDATE SET body = messages.body
+            RETURNING *
+        `
+        if (row) result = row as MessageRow
+    }
+
+    return result
 }
 
-// A page of the conversation between two users, newest first. `id` is the
-// cursor — bigserial is already strictly increasing in insertion order, so
-// there's no need for a separate timestamp cursor or tie-breaking.
-// `before` is exclusive: pass the oldest id from the previous page to get the
-// next one back; omit it for the first page.
+// A page of the conversation between two users, newest first. Single-shard:
+// a message between these two users was duplicated onto both of their home
+// shards when it was sent (see insertMessage), so the caller's own shard
+// always has a complete copy of the conversation — never a cross-shard join.
+//
+// `before` is exclusive: pass the oldest created_at from the previous page to
+// get the next one back; omit it for the first page.
 export async function getMessages(
     username: string,
     otherUsername: string,
     before: string | null,
     limit: number
-): Promise<MessageWithSender[]> {
+): Promise<MessageRow[]> {
+    const home = shardFor(username)
+
     const rows = before
-        ? await sql`
-            WITH me AS (SELECT id FROM users WHERE username = ${username}),
-                 them AS (SELECT id FROM users WHERE username = ${otherUsername})
-            SELECT m.*, sender.username AS sender_username
-            FROM messages m
-            JOIN users sender ON sender.id = m.sender_id, me, them
-            WHERE ((m.sender_id = me.id AND m.recipient_id = them.id)
-                OR (m.sender_id = them.id AND m.recipient_id = me.id))
-              AND m.id < ${before}
-            ORDER BY m.id DESC
+        ? await home`
+            SELECT * FROM messages
+            WHERE ((sender_username = ${username} AND recipient_username = ${otherUsername})
+                OR (sender_username = ${otherUsername} AND recipient_username = ${username}))
+              AND created_at < ${before}
+            ORDER BY created_at DESC
             LIMIT ${limit}
         `
-        : await sql`
-            WITH me AS (SELECT id FROM users WHERE username = ${username}),
-                 them AS (SELECT id FROM users WHERE username = ${otherUsername})
-            SELECT m.*, sender.username AS sender_username
-            FROM messages m
-            JOIN users sender ON sender.id = m.sender_id, me, them
-            WHERE (m.sender_id = me.id AND m.recipient_id = them.id)
-               OR (m.sender_id = them.id AND m.recipient_id = me.id)
-            ORDER BY m.id DESC
+        : await home`
+            SELECT * FROM messages
+            WHERE (sender_username = ${username} AND recipient_username = ${otherUsername})
+               OR (sender_username = ${otherUsername} AND recipient_username = ${username})
+            ORDER BY created_at DESC
             LIMIT ${limit}
         `
-    return rows as MessageWithSender[]
+    return rows as MessageRow[]
 }
 
 // Re-registering the same token (app reinstall, re-login) reassigns it to
 // whoever is calling now rather than erroring or leaving a stale owner.
+// Single-shard: a push token belongs to exactly one user and is never read by
+// anyone else, so — unlike friendships/snaps/messages — it's never duplicated.
 export async function upsertPushToken(username: string, token: string): Promise<void> {
-    await sql`
+    await shardFor(username)`
         INSERT INTO push_tokens (token, user_id)
         SELECT ${token}, id FROM users WHERE username = ${username}
         ON CONFLICT (token) DO UPDATE SET user_id = EXCLUDED.user_id
     `
 }
 
-export async function getIncomingFriendRequests(username: string): Promise<IncomingFriendRequest[]> {
-    const rows = await sql`
-        WITH me AS (
-            SELECT id FROM users WHERE username = ${username}
+// The last message with every friend this user has ever exchanged one with,
+// newest first. Single-shard, same reasoning as getMessages: every message
+// touching this user was duplicated onto their own shard when it was sent.
+//
+// `unread` is true only when the last message is both from the other person
+// (sending doesn't leave anything for ME to read) and newer than my own
+// last-read mark for that conversation — no mark at all counts as unread.
+export async function getConversations(username: string): Promise<ConversationEntry[]> {
+    const rows = await shardFor(username)`
+        WITH last_messages AS (
+            SELECT DISTINCT ON (other_username) *
+            FROM (
+                SELECT
+                    CASE WHEN sender_username = ${username} THEN recipient_username ELSE sender_username END AS other_username,
+                    body,
+                    sender_username,
+                    created_at
+                FROM messages
+                WHERE sender_username = ${username} OR recipient_username = ${username}
+            ) m
+            ORDER BY other_username, created_at DESC
         )
         SELECT
-            u.username,
-            f.created_at
-        FROM friendships f
-        JOIN me ON me.id = f.friend_id
-        JOIN users u ON u.id = f.user_id
-        LEFT JOIN friendships r
-               ON r.user_id = f.friend_id AND r.friend_id = f.user_id
-        WHERE r.user_id IS NULL
-        ORDER BY f.created_at DESC
+            lm.other_username,
+            lm.body AS last_message_body,
+            lm.sender_username AS last_message_sender,
+            lm.created_at AS last_message_at,
+            (lm.sender_username <> ${username} AND lm.created_at > COALESCE(mr.last_read_at, '-infinity'))
+                AS unread
+        FROM last_messages lm
+        LEFT JOIN message_reads mr
+               ON mr.username = ${username} AND mr.other_username = lm.other_username
+        ORDER BY lm.created_at DESC
     `
-    return rows as IncomingFriendRequest[]
+    return rows as ConversationEntry[]
+}
+
+// Called whenever `username` fetches the newest page of a conversation
+// (services.getMessages) — that's "they saw the top of it", which is as
+// close to a read receipt as this app tracks.
+export async function markConversationRead(username: string, otherUsername: string): Promise<void> {
+    await shardFor(username)`
+        INSERT INTO message_reads (username, other_username, last_read_at)
+        VALUES (${username}, ${otherUsername}, now())
+        ON CONFLICT (username, other_username) DO UPDATE SET last_read_at = EXCLUDED.last_read_at
+    `
 }

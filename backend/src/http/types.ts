@@ -138,3 +138,17 @@ export type GetMessagesResponse = {
     // wasn't full — there's nothing older left.
     next_cursor: string | null
 }
+
+export type ApiConversation = {
+    username: string
+    last_message: {
+        body: string
+        sender_username: string
+        created_at: string
+    }
+    unread: boolean
+}
+
+export type GetConversationsResponse = {
+    conversations: ApiConversation[]
+}

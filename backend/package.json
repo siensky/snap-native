@@ -4,7 +4,7 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "dev": "bun run --sql-preconnect src/index.ts"
+    "dev": "bun run src/index.ts"
   },
   "devDependencies": {
     "@types/amqplib": "^0.10.8",

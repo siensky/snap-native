@@ -1,11 +1,12 @@
 // Row types mirror db/migrations/ exactly — these are what Bun's Postgres
-// driver actually hands back, so two mappings matter:
+// driver actually hands back, and now that every table uses `uuid` primary
+// keys (sharding requirement — see db/shards.ts), that's simply `string`,
+// the same way a bigint id already was pre-sharding.
 //
-//   bigint / bigserial  ->  string   (int8 can exceed Number.MAX_SAFE_INTEGER)
-//   timestamptz         ->  Date
-//
-// The bigint-as-string one bites: `row.id === 1` is always false, and
-// `${row.id}` in a query is still correct because the driver re-encodes it.
+// Nothing here carries a bare numeric/uuid id for the OTHER party in a
+// two-user row (friendships, snaps, messages): a foreign key to users(id)
+// can't cross a database boundary, so those columns are usernames instead.
+// See db/migrations/20260902091500_initial.sql for why.
 
 export type UserRow = {
     id: string
@@ -40,7 +41,7 @@ export type FriendListEntry = PublicUser & {
 // friendship table in UPPGIFT.md, the one deliberately absent from getFriends.
 //
 // Unlike FriendListEntry, created_at here is when the *request* was made
-// (friendships.created_at), not when the account was created: a request list is
+// (friendships.created_at), not when the account was created — a request list is
 // sorted and read by recency of the request.
 export type IncomingFriendRequest = {
     username: string
@@ -66,19 +67,13 @@ export type CreateSnapInput = {
 // be undefined at runtime while typed as present.
 export type SnapRow = {
     id: string
-    sender_id: string
+    sender_username: string
     type: SnapType
     body: string | null
     media_key: string | null
     media_mime: string | null
     expires_at: Date
     created_at: Date
-}
-
-// A snap read back with its sender resolved. Only the read path joins users, so
-// only the read path gets this — see claimSnapForRecipient.
-export type SnapWithSender = SnapRow & {
-    sender_username: string
 }
 
 // One entry in a user's inbox. Metadata only: listing what's waiting must never
@@ -93,31 +88,34 @@ export type InboxEntry = {
 
 export type SnapRecipientRow = {
     snap_id: string
-    recipient_id: string
+    recipient_username: string
     screenshot: boolean
     viewed_at: Date | null
 }
 
 export type FriendshipRow = {
-    user_id: string
-    friend_id: string
+    user_username: string
+    friend_username: string
     created_at: Date
 }
 
 export type MessageRow = {
     id: string
     client_id: string
-    sender_id: string
-    recipient_id: string
+    sender_username: string
+    recipient_username: string
     body: string
     created_at: Date
 }
 
-// The read path joins the sender's username in — same split as
-// SnapRow/SnapWithSender, and for the same reason: nothing public should ever
-// carry a bare numeric id.
-export type MessageWithSender = MessageRow & {
-    sender_username: string
+// One row per friend you've ever exchanged a message with, newest first —
+// what the Chats tab sorts and badges by.
+export type ConversationEntry = {
+    other_username: string
+    last_message_body: string
+    last_message_sender: string
+    last_message_at: Date
+    unread: boolean
 }
 
 // SnapRow keeps every optional column nullable because the columns are.
@@ -126,7 +124,7 @@ export type MessageWithSender = MessageRow & {
 
 type SnapBase = {
     id: string
-    sender_id: string
+    sender_username: string
     expires_at: Date
     created_at: Date
 }
@@ -145,7 +143,7 @@ export type Snap =
 export function toSnap(row: SnapRow): Snap {
     const base: SnapBase = {
         id: row.id,
-        sender_id: row.sender_id,
+        sender_username: row.sender_username,
         expires_at: row.expires_at,
         created_at: row.created_at,
     }

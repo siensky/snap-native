@@ -218,3 +218,9 @@ export async function registerPushToken(req: FastifyRequest<{ Body: RegisterPush
 
     res.status(204).send()
 }
+
+export async function getConversations(req: FastifyRequest, res: FastifyReply) {
+    const page = await services.getConversations(req.user.username)
+
+    res.status(200).send(page)
+}

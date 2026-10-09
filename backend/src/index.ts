@@ -28,6 +28,9 @@ await httpServer.register(websocket)
 
 const port = Number(process.env.PORT ?? 3000);
 
-await httpServer.listen({ port });
+// Fastify's own default is 127.0.0.1, which is unreachable from any other
+// container — Nginx connecting to a replica's Docker-network IP would get
+// "connection refused" even though the process is clearly up and listening.
+await httpServer.listen({ port, host: "0.0.0.0" });
 
 console.log(`Listening on http://localhost:${port}`);

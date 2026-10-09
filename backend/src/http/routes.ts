@@ -102,6 +102,13 @@ async function routes(httpServer: FastifyInstance) {
         handler: controllers.registerPushToken
     })
 
+    httpServer.route({
+        method: 'GET',
+        url: '/conversations',
+        preHandler: [httpServer.authenticate],
+        handler: controllers.getConversations
+    })
+
 }
 
 export default routes

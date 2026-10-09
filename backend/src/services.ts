@@ -1,6 +1,7 @@
 import { AlreadyExists, BadRequest, NotFound, Unauthorized } from './errors'
-import type { AddFriendResponse, ApiFriend, ApiFriendRequest, ApiMessage, ApiSnap, ApiSnapSummary, ApiUser, AuthRequest, GetMessagesResponse, SendMessageResponse, SendSnapResponse } from './http/types'
+import type { AddFriendResponse, ApiFriend, ApiFriendRequest, ApiMessage, ApiSnap, ApiSnapSummary, ApiUser, AuthRequest, GetConversationsResponse, GetMessagesResponse, SendMessageResponse, SendSnapResponse } from './http/types'
 import * as repository from './repository'
+import type { MessageRow } from './repository/types'
 import { hashPassword, verifyPassword } from './utils/password';
 import * as s3 from './utils/s3'
 import * as websocket from './websocket/controllers'
@@ -171,7 +172,7 @@ export async function sendSnap(input: SendSnapInput): Promise<SendSnapResponse> 
 
         await s3.uploadFile(key, input.image, input.mimetype)
 
-        await repository.setSnapMedia(createdSnap.id, key, input.mimetype)
+        await repository.setSnapMedia(createdSnap.id, key, input.mimetype, recipients)
     }
 
     // Notify last, once the snap is durable. A recipient who is offline finds it
@@ -186,11 +187,13 @@ export async function sendSnap(input: SendSnapInput): Promise<SendSnapResponse> 
     }
 }
 
-// Snap ids are bigserial. A non-numeric id would make Postgres throw on the
-// cast — a 500 — instead of simply matching no rows, so it's rejected up front
-// as the same 404 every other miss produces.
+// Snap ids are uuid. A malformed id would make Postgres throw on the cast —
+// a 500 — instead of simply matching no rows, so it's rejected up front as
+// the same 404 every other miss produces.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
 function assertSnapId(snapId: string): void {
-    if (!/^\d+$/.test(snapId)) throw new NotFound('Snap not found')
+    if (!UUID_RE.test(snapId)) throw new NotFound('Snap not found')
 }
 
 // Read a snap once. The read is destructive: claimSnapForRecipient stamps
@@ -300,7 +303,7 @@ export async function registerPushToken(username: string, token: string): Promis
 
 const MESSAGES_PAGE_SIZE = 50
 
-function toApiMessage(message: Awaited<ReturnType<typeof repository.getMessages>>[number]): ApiMessage {
+function toApiMessage(message: MessageRow): ApiMessage {
     return {
         id: message.id,
         sender_username: message.sender_username,
@@ -321,10 +324,40 @@ export async function getMessages(
 
     const messages = await repository.getMessages(username, otherUsername, before, MESSAGES_PAGE_SIZE)
 
+    // Only the newest page counts as "seeing" the conversation — paging into
+    // older history shouldn't mark anything read that wasn't already.
+    if (!before) await repository.markConversationRead(username, otherUsername)
+
     return {
         messages: messages.map(toApiMessage),
         // Fewer rows than the page size means there's nothing older left.
-        next_cursor: messages.length === MESSAGES_PAGE_SIZE ? messages[messages.length - 1]!.id : null,
+        // created_at, not id: a uuid carries no chronological order the way
+        // the old bigserial id did, so the cursor has to be the timestamp
+        // that getMessages actually orders and filters by.
+        next_cursor:
+            messages.length === MESSAGES_PAGE_SIZE
+                ? messages[messages.length - 1]!.created_at.toISOString()
+                : null,
+    }
+}
+
+// Every friend this user has ever exchanged a message with, newest activity
+// first — what the Chats tab sorts by and badges with an unread indicator.
+// Friends never messaged at all just don't appear; the client merges this
+// against the full friend list itself.
+export async function getConversations(username: string): Promise<GetConversationsResponse> {
+    const conversations = await repository.getConversations(username)
+
+    return {
+        conversations: conversations.map((c) => ({
+            username: c.other_username,
+            last_message: {
+                body: c.last_message_body,
+                sender_username: c.last_message_sender,
+                created_at: c.last_message_at.toISOString(),
+            },
+            unread: c.unread,
+        })),
     }
 }
 

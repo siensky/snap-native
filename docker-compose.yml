@@ -2,7 +2,8 @@ networks:
   internal:
 
 volumes:
-  postgres-data:
+  postgres-a-data:
+  postgres-b-data:
   rabbitmq-data:
 
 configs:
@@ -22,18 +23,27 @@ configs:
           listen 80;
 
           location / {
-            set $backend_upstream http://backend:3000;
-            proxy_pass $backend_upstream;
+            # $$ — a literal $ for nginx, escaped so Compose's own variable
+            # interpolation doesn't swallow these as its own variables (it
+            # already silently emptied them once; `docker compose config`
+            # is what catches this class of bug).
+            set $$backend_upstream http://backend:3000;
+            proxy_pass $$backend_upstream;
             proxy_http_version 1.1;
-            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Upgrade $$http_upgrade;
             proxy_set_header Connection "upgrade";
-            proxy_set_header Host $host;
+            proxy_set_header Host $$host;
           }
         }
       }
 
 services:
-  postgres:
+  # Two independent databases — "DB Router" in architecture.png. The routing
+  # itself lives in code (backend/src/db/shards.ts, notification-service/src/shards.ts),
+  # not as a separate proxy service: building a real Postgres-wire-protocol
+  # proxy is its own project, and a few lines of TypeScript do the same job
+  # for what this assignment needs.
+  postgres-a:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
@@ -41,7 +51,23 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - postgres-a-data:/var/lib/postgresql/data
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  postgres-b:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres-b-data:/var/lib/postgresql/data
     networks: [internal]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER"]
@@ -76,11 +102,14 @@ services:
       replicas: ${BACKEND_INSTANCES:-3}
     env_file: ./backend/.env
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DATABASE_URL_A: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-a:5432/${POSTGRES_DB}?sslmode=disable
+      DATABASE_URL_B: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-b:5432/${POSTGRES_DB}?sslmode=disable
       RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672
     command: bun run dev
     depends_on:
-      postgres:
+      postgres-a:
+        condition: service_healthy
+      postgres-b:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
@@ -92,10 +121,13 @@ services:
       dockerfile: ../Dockerfile
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DATABASE_URL_A: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-a:5432/${POSTGRES_DB}?sslmode=disable
+      DATABASE_URL_B: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-b:5432/${POSTGRES_DB}?sslmode=disable
       RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672
     depends_on:
-      postgres:
+      postgres-a:
+        condition: service_healthy
+      postgres-b:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy

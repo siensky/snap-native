@@ -1,4 +1,5 @@
 import type { SnapRow } from '../repository/types'
+import * as rabbitmq from '../rabbitmq/publisher'
 import { getWebsocketServer, userRoom } from './server'
 import type { ServerToClientEvents } from './types'
 
@@ -11,23 +12,22 @@ import type { ServerToClientEvents } from './types'
 // finds it through GET /snaps or GET /friends/requests instead. So emitting is
 // fire-and-forget: never awaited, and it never throws into the request path.
 //
-// Payloads are plain objects — socket.io serializes them itself, so
-// JSON.stringify here would make the client parse a string out of a string.
+// The four functions below go through rabbitmq/publisher.ts rather than
+// emitting locally — the recipient can be connected to any instance, not just
+// this one, and the exchange (see rabbitmq/consumer.ts) is what finds them.
 
 export function sendSnapNotification(
     recipientUsername: string,
     snap: SnapRow,
     senderUsername: string
 ): void {
-    getWebsocketServer()
-        ?.to(userRoom(recipientUsername))
-        .emit('snap_received', {
-            snap_id: snap.id,
-            sender_username: senderUsername,
-            type: snap.type,
-            created_at: snap.created_at.toISOString(),
-            expires_at: snap.expires_at.toISOString(),
-        })
+    rabbitmq.publishToUser(recipientUsername, 'snap_received', {
+        snap_id: snap.id,
+        sender_username: senderUsername,
+        type: snap.type,
+        created_at: snap.created_at.toISOString(),
+        expires_at: snap.expires_at.toISOString(),
+    })
 }
 
 // Someone added you and you haven't added them back.
@@ -35,12 +35,10 @@ export function sendFriendRequestNotification(
     recipientUsername: string,
     fromUsername: string
 ): void {
-    getWebsocketServer()
-        ?.to(userRoom(recipientUsername))
-        .emit('friend_request', {
-            from: fromUsername,
-            created_at: new Date().toISOString(),
-        })
+    rabbitmq.publishToUser(recipientUsername, 'friend_request', {
+        from: fromUsername,
+        created_at: new Date().toISOString(),
+    })
 }
 
 // The second of the two directed edges just landed, so both sides go from
@@ -49,33 +47,17 @@ export function sendFriendAcceptedNotification(
     accepterUsername: string,
     otherUsername: string
 ): void {
-    const server = getWebsocketServer()
-    if (!server) return
-
     const createdAt = new Date().toISOString()
 
-    server.to(userRoom(accepterUsername)).emit('friend_accepted', {
+    rabbitmq.publishToUser(accepterUsername, 'friend_accepted', {
         username: otherUsername,
         created_at: createdAt,
     })
 
-    server.to(userRoom(otherUsername)).emit('friend_accepted', {
+    rabbitmq.publishToUser(otherUsername, 'friend_accepted', {
         username: accepterUsername,
         created_at: createdAt,
     })
-}
-
-// For events coming from another backend instance via RabbitMQ (rabbitmq/consumer.ts):
-// the event name is only known at runtime, so unlike the functions above this
-// can't be typed any tighter than this without the caller doing it for us.
-export function emitToUser(
-    username: string,
-    event: keyof ServerToClientEvents,
-    payload: unknown
-): void {
-    getWebsocketServer()
-        ?.to(userRoom(username))
-        .emit(event, payload as never)
 }
 
 // Goes to the sender of the snap, not to the person who took the screenshot.
@@ -84,11 +66,24 @@ export function sendScreenshotNotification(
     snapId: string,
     byUsername: string
 ): void {
+    rabbitmq.publishToUser(senderUsername, 'screenshot_taken', {
+        snap_id: snapId,
+        by: byUsername,
+        created_at: new Date().toISOString(),
+    })
+}
+
+// Called only from rabbitmq/consumer.ts: a message arrived over the exchange
+// for a user connected to THIS instance, so this is the one place that still
+// emits locally rather than publishing back out. The event name is only known
+// at runtime, so unlike the functions above this can't be typed any tighter
+// than this without the caller doing it for us.
+export function emitToUser(
+    username: string,
+    event: keyof ServerToClientEvents,
+    payload: unknown
+): void {
     getWebsocketServer()
-        ?.to(userRoom(senderUsername))
-        .emit('screenshot_taken', {
-            snap_id: snapId,
-            by: byUsername,
-            created_at: new Date().toISOString(),
-        })
+        ?.to(userRoom(username))
+        .emit(event, payload as never)
 }
